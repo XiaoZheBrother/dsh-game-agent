@@ -1,0 +1,45 @@
+{
+  "name": "dsh-game-agent",
+  "version": "0.1.0-alpha.1",
+  "description": "DSH 游戏 Agent：工具选择、观众指令、自主决策与可追溯经验",
+  "type": "module",
+  "main": "index.js",
+  "license": "MIT",
+  "keywords": [
+    "dsh-plugin",
+    "dsh",
+    "agent",
+    "game"
+  ],
+  "files": [
+    "index.js",
+    "launcher.mjs",
+    "cordis.patch.yml",
+    "backend",
+    "examples",
+    "requirements.txt",
+    "README.md",
+    "NOTICE.md",
+    "LICENSE",
+    "adapters"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "^3.18.4",
+    "dsh-live-studio": "^0.1.0-alpha.1"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node --check index.js"
+  },
+  "author": {
+    "name": "XiaoZheBrother",
+    "email": "958117002@qq.com"
+  }
+}

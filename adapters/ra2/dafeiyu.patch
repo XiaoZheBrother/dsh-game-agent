@@ -1,0 +1,1183 @@
+diff --git a/.agents/skills/ra2-battle-control/scripts/contracts.ts b/.agents/skills/ra2-battle-control/scripts/contracts.ts
+index 35de826..608f596 100644
+--- a/.agents/skills/ra2-battle-control/scripts/contracts.ts
++++ b/.agents/skills/ra2-battle-control/scripts/contracts.ts
+@@ -11,6 +11,7 @@ export interface BattleEntity {
+   id: string;
+   kind: 'vehicle' | 'infantry' | 'aircraft' | 'building';
+   owner: number;
++  relation?: 'self' | 'ally' | 'neutral' | 'enemy' | 'unknown';
+   /** Private status is available only for owned entities. */
+   health?: number;
+   cell: { x: number; y: number };
+@@ -42,6 +43,10 @@ export interface BattleObservation {
+     foundation?: { width: number; height: number };
+   }[];
+   entities: BattleEntity[];
++  /** Map-wide owned units only. Enemy observations remain viewport/fog limited. */
++  /** Local terrain samples, not passability or hidden enemy intelligence. */
++  exploration?: { source: 'native-local-shroud'; frontiers: { x: number; y: number }[] };
++  owned?: Pick<BattleEntity, 'id' | 'kind' | 'owner' | 'relation' | 'type' | 'cell' | 'health' | 'mission'>[];
+   /** Own powers with actual native sidebar cameos; no enemy cooldown state. */
+   supportPowers?: { type: string; tab: number; ready: boolean; onHold: boolean; requiresTarget: boolean }[];
+   /** Native player targeting mode, including a subsequent click of a multi-stage power. */
+diff --git a/docs/AI_CONTROL.md b/docs/AI_CONTROL.md
+index 10a1030..3858bb3 100644
+--- a/docs/AI_CONTROL.md
++++ b/docs/AI_CONTROL.md
+@@ -4,6 +4,19 @@ The browser runs the original game. A loopback server routes JSON requests from
+ 
+ The contract exposes player-level observations and actions so an agent can play through the normal game rules. Observations must not disclose hidden world state, and actions must retain native prerequisites, production queues, pathfinding, placement and combat resolution. A successful transport or queue receipt is not proof of a successful game action.
+ 
++## Scouting and neutral oil capture
++
++`observe.exploration` contains bounded `native-local-shroud` frontier samples near
++owned mobile units. Samples distinguish valid shrouded cells from revealed terrain;
++they do not expose hidden objects, guarantee passability, or represent a complete
++exploration map. A controller must track movement and abandon stalled destinations.
++
++`act` with `action: "capture"`, one owned visible engineer `unit`, and a visible
++neutral `CAOILD` `target` uses the native target-click decision path. It does not
++force ownership or bypass pathfinding. Other unit/target combinations are rejected.
++Confirm completion only when an observation lists the oil derrick as owned; a
++submitted receipt, missing engineer, or disappeared target is not capture proof.
++
+ ## Distribute the control skill
+ 
+ The complete CLI, `serve` router, client helpers and agent launcher live in
+diff --git a/scripts/vm/buildV86.mts b/scripts/vm/buildV86.mts
+index 91c9fd5..507d69e 100644
+--- a/scripts/vm/buildV86.mts
++++ b/scripts/vm/buildV86.mts
+@@ -69,6 +69,35 @@ if (!existsSync(resolve(source, '.git'))) {
+ run('git', ['reset', '--hard', revision], source);
+ run('git', ['apply', '--check', patch], source);
+ run('git', ['apply', patch], source);
++if (process.platform === 'win32') {
++  // Upstream's executable Python linker shim assumes POSIX filenames and shebang execution.
++  const wrapper = readFileSync(resolve(source, 'tools/rust-lld-wrapper'), 'utf8')
++    .replace(
++      'args = sys.argv[1:]',
++      `args = sys.argv[1:]
++    import shlex
++    expanded = []
++    for arg in args:
++        if arg.startswith('@'):
++            with open(arg[1:], encoding='utf-8') as response:
++                expanded.extend(shlex.split(response.read()))
++        else:
++            expanded.append(arg)
++    args = expanded`,
++    )
++    .replace('== "rustc"', 'in ("rustc", "rustc.exe")')
++    .replace('"bin/rust-lld")', '"bin/rust-lld.exe")');
++  writeFileSync(resolve(source, 'tools/rust-lld-wrapper-windows.py'), wrapper);
++  writeFileSync(
++    resolve(source, 'tools/rust-lld-wrapper-windows.cmd'),
++    '@echo off\r\npython3 "%~dp0rust-lld-wrapper-windows.py" %*\r\n',
++  );
++  const makefile = resolve(source, 'Makefile');
++  writeFileSync(
++    makefile,
++    readFileSync(makefile, 'utf8').replaceAll('tools/rust-lld-wrapper', 'tools/rust-lld-wrapper-windows.cmd'),
++  );
++}
+ run('make', ['build/v86.wasm', 'STRIP_DEBUG=true'], source);
+ const built = resolve(source, 'build/v86.wasm');
+ if (!hasSingleStep(built)) throw new Error('Built CPU lacks the required single-step capability');
+diff --git a/src/adapter/audio.ts b/src/adapter/audio.ts
+index 54a3d4a..dec734c 100644
+--- a/src/adapter/audio.ts
++++ b/src/adapter/audio.ts
+@@ -116,6 +116,19 @@ export class WebAudioPcmSink {
+   private context: AudioContext | null = null;
+   private destroyed = false;
+   private masterGain: GainNode | null = null;
++  private captureDestination: MediaStreamAudioDestinationNode | null = null;
++
++  /** Session-owned mix; consumers must clone tracks before taking ownership. */
++  getCaptureStream(): MediaStream | null {
++    if (this.destroyed) return null;
++    const context = this.ensureContext();
++    if (!context) return null;
++    if (!this.captureDestination) {
++      this.captureDestination = context.createMediaStreamDestination();
++      this.masterDestination(context).connect(this.captureDestination);
++    }
++    return this.captureDestination.stream;
++  }
+   /** Linear master gain 0..1, applied after all buffers and before the destination. */
+   private masterVolume = DEFAULT_MASTER_VOLUME;
+ 
+@@ -413,6 +426,9 @@ export class WebAudioPcmSink {
+     this.stopAll();
+     this.buffers.clear();
+     this.destroyed = true;
++    this.captureDestination?.stream.getTracks().forEach((track) => track.stop());
++    this.captureDestination?.disconnect();
++    this.captureDestination = null;
+     const context = this.context;
+     this.context = null;
+     if (context && context.state !== 'closed') {
+@@ -773,6 +789,8 @@ export class WebAudioPcmSink {
+       }
+       // A new context needs a new master gain node; the old node is destroyed with its context.
+       this.masterGain = null;
++      this.captureDestination?.stream.getTracks().forEach((track) => track.stop());
++      this.captureDestination = null;
+       if (this.options.diagnosticsIntervalMs) {
+         const context = this.context;
+         context.addEventListener('statechange', () =>
+diff --git a/src/adapter/runtime.ts b/src/adapter/runtime.ts
+index e5f4644..44b888e 100644
+--- a/src/adapter/runtime.ts
++++ b/src/adapter/runtime.ts
+@@ -154,6 +154,7 @@ export async function createVmShell(
+     preferredGameId: source.game.id,
+     ...(additionalFiles?.size ? { additionalFiles: collectTransferEntries(additionalFiles, transfer) } : {}),
+     ...(source.sessionFiles?.size ? { sessionFiles: collectTransferEntries(source.sessionFiles, transfer) } : {}),
++    ...(source.preserveGameSettings ? { preserveGameSettings: true } : {}),
+     ...(options.resolution ? { resolution: options.resolution } : {}),
+     playerName,
+     startupPage: options.startupPage,
+@@ -315,6 +316,10 @@ export class Win32GameVm implements VmShell {
+     this.core.setMasterVolume(linear);
+   }
+ 
++  getAudioStream(): MediaStream | null {
++    return this.audio.getCaptureStream();
++  }
++
+   getGamePerformance(): Promise<GamePerformanceSample | null> {
+     return this.core.getGamePerformance();
+   }
+diff --git a/src/adapter/vmClient.ts b/src/adapter/vmClient.ts
+index 77621a1..55232a9 100644
+--- a/src/adapter/vmClient.ts
++++ b/src/adapter/vmClient.ts
+@@ -185,6 +185,10 @@ export class WorkerVmClient implements VmShell {
+     this.send({ type: 'volume', linear });
+   }
+ 
++  getAudioStream(): MediaStream | null {
++    return this.audio.getCaptureStream();
++  }
++
+   async getGamePerformance(): Promise<GamePerformanceSample | null> {
+     return this.request((requestId) => ({ type: 'game-performance', requestId }));
+   }
+@@ -480,12 +484,19 @@ export class WorkerVmClient implements VmShell {
+     if (this.frameAckRaf !== null) return;
+     this.frameAckRaf = requestAnimationFrame(() => {
+       this.frameAckRaf = null;
+-      const acknowledged = this.pendingFrameAck;
+-      this.pendingFrameAck = 0;
+-      if (acknowledged) this.send({ type: 'frame-ack', frameId: acknowledged });
++      this.notifyFramePresented();
+     });
+   }
+ 
++  /** External capture must finish copying before releasing the next worker frame. */
++  notifyFramePresented(): void {
++    if (this.frameAckRaf !== null) cancelAnimationFrame(this.frameAckRaf);
++    this.frameAckRaf = null;
++    const acknowledged = this.pendingFrameAck;
++    this.pendingFrameAck = 0;
++    if (acknowledged && this.lifecycle === 'active') this.send({ type: 'frame-ack', frameId: acknowledged });
++  }
++
+   private applyAudioOp(op: AudioOp): void {
+     switch (op.op) {
+       case 'createBuffer':
+diff --git a/src/adapter/vmCore.ts b/src/adapter/vmCore.ts
+index a766cc9..0dce1ce 100644
+--- a/src/adapter/vmCore.ts
++++ b/src/adapter/vmCore.ts
+@@ -1,4 +1,5 @@
+ import { readDebugContext, writeDebugContext } from '../vm86/debugContext';
++import { gameResolutionIni } from '../games/resolution';
+ import type { ProcessDebugger } from '../vm86/processDebugger';
+ import {
+   GuestProcessKernel,
+@@ -568,6 +569,15 @@ export class VmCore {
+   }
+ 
+   async gameControl(method: string, params?: unknown): Promise<unknown> {
++    if (method === 'ui.replaySettings') {
++      const result = this.control?.battleResult?.();
++      if (!result || !['victory', 'defeat'].includes(result.outcome)) throw new Error('No confirmed native result');
++      if (!['ra2', 'yr'].includes(this.source.game.id)) throw new Error('Replay settings unsupported');
++      const path = gameResolutionIni(this.source.game.id);
++      const bytes = this.shim?.getMountedFileBytes(path);
++      if (!bytes?.length || bytes.length > 65536) throw new Error('Saved game settings unavailable');
++      return { path, bytes: Array.from(bytes) };
++    }
+     if (method === 'ui.status') {
+       const page = this.shim?.inspectShellPageTitle() ?? null;
+       const battleResult = this.control?.battleResult?.() ?? null;
+diff --git a/src/adapter/vmProtocol.ts b/src/adapter/vmProtocol.ts
+index 0b6740a..a0d0f87 100644
+--- a/src/adapter/vmProtocol.ts
++++ b/src/adapter/vmProtocol.ts
+@@ -40,6 +40,7 @@ export interface VmInitConfig {
+   additionalFiles?: GameFileEntry[];
+   /** Explicit game launch choices; buffers are independent transfer copies. */
+   sessionFiles?: GameFileEntry[];
++  preserveGameSettings?: boolean;
+   /** Startup resolution applied only in the memory-provider overlay after reading the original INI; never write to the user's directory. */
+   resolution?: GameResolution;
+   /** Overlay the INI after rebuilding the Worker provider; development HTTP mode must retain the player name too. */
+diff --git a/src/adapter/vmShell.ts b/src/adapter/vmShell.ts
+index 61edd29..8b633b6 100644
+--- a/src/adapter/vmShell.ts
++++ b/src/adapter/vmShell.ts
+@@ -44,6 +44,8 @@ export interface VmAttachResult {
+ }
+ 
+ export interface VmShell extends SessionRuntime {
++  /** A capture consumer has synchronously presented the latest frame. */
++  notifyFramePresented?(): void;
+   gameControl(method: string, params?: unknown): Promise<unknown>;
+   readonly runtimeInfo: VmRuntimeInfo;
+   getDiagnostics(action: VmDiagnosticAction): Promise<VmDiagnostics>;
+@@ -58,6 +60,7 @@ export interface VmShell extends SessionRuntime {
+   setCursorPosition(x: number, y: number): void;
+   setGameClockRate(rate: number): number;
+   setMasterVolume(linear: number): void;
++  getAudioStream?(): MediaStream | null;
+   getPointerState(): Promise<VmPointerState | null>;
+   /** Read the actual logic frame rate on demand; return null if unsupported or unloaded. */
+   getGamePerformance(): Promise<GamePerformanceSample | null>;
+diff --git a/src/adapter/vmWorkerController.ts b/src/adapter/vmWorkerController.ts
+index 8298efc..fc4b943 100644
+--- a/src/adapter/vmWorkerController.ts
++++ b/src/adapter/vmWorkerController.ts
+@@ -351,7 +351,10 @@ export class VmWorkerController {
+         ),
+       };
+     const source = await withMultiplayerNameOverride(
+-      await this.dependencies.applyResolution(mounted, config.resolution),
++      await this.dependencies.applyResolution(
++        { ...mounted, preserveGameSettings: config.preserveGameSettings },
++        config.resolution,
++      ),
+       config.playerName,
+     );
+     this.sourceTemplate = source.files;
+diff --git a/src/app/session/applicationControl.ts b/src/app/session/applicationControl.ts
+index ead5dae..31d2998 100644
+--- a/src/app/session/applicationControl.ts
++++ b/src/app/session/applicationControl.ts
+@@ -9,12 +9,13 @@ export interface ApplicationControlState {
+ export function createApplicationControl(deps: {
+   state(): ApplicationControlState;
+   runtime(method: string, params?: unknown): Promise<unknown>;
+-  quickStart(isCurrent: () => boolean): Promise<void>;
++  quickStart(isCurrent: () => boolean, replay?: boolean): Promise<void>;
+   capture?(): Promise<unknown>;
+ }) {
+   let starting = false;
+   let failure: string | null = null;
+   let disposed = false;
++  const replayed = new Set<string>();
+   const receipts = new Map<string, { fingerprint: string; result: { state: string; commandId: string } }>();
+   return {
+     async request(method: string, params?: unknown): Promise<unknown> {
+@@ -26,6 +27,7 @@ export function createApplicationControl(deps: {
+           ...state,
+           starting,
+           failure,
++          features: ['replay-native-settings-v1'],
+           runtime,
+           actions: [
+             ...(state.hasResources && !starting ? ['ui.quickStart'] : []),
+@@ -44,11 +46,11 @@ export function createApplicationControl(deps: {
+           throw new Error('Session changed during screenshot');
+         return { pageId, image };
+       }
+-      if (method !== 'ui.quickStart') return deps.runtime(method, params);
++      if (method !== 'ui.quickStart' && method !== 'ui.nextBattle') return deps.runtime(method, params);
+       const p = params && typeof params === 'object' ? (params as Record<string, unknown>) : {};
+       if (typeof p.commandId !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(p.commandId))
+         throw new Error('Invalid commandId');
+-      const fingerprint = JSON.stringify(params);
++      const fingerprint = method + ':' + JSON.stringify(params);
+       const previous = receipts.get(p.commandId);
+       if (previous) {
+         if (previous.fingerprint !== fingerprint) throw new Error('commandId reused with different parameters');
+@@ -60,6 +62,26 @@ export function createApplicationControl(deps: {
+       if (state.hasRuntime && p.replaceSession !== true)
+         throw new Error('Set replaceSession=true to discard the current runtime and unsaved match');
+       if (receipts.size >= 100) throw new Error('Page restart command limit reached');
++      if (method === 'ui.nextBattle') {
++        const runtime = (await deps.runtime('ui.status')) as {
++          battlefield?: { ready?: boolean };
++          battleResult?: { sessionId?: string; outcome?: string; source?: string };
++        };
++        const result = runtime?.battleResult;
++        if (
++          runtime?.battlefield?.ready ||
++          !result ||
++          result.source !== 'native-game-loop' ||
++          !['victory', 'defeat'].includes(result.outcome ?? '') ||
++          !result.sessionId ||
++          result.sessionId !== p.expectedSessionId
++        )
++          throw new Error('Next battle requires this session native victory or defeat');
++        if (disposed || starting || deps.state().pageId !== state.pageId)
++          throw new Error('Page changed while checking result');
++        if (replayed.has(result.sessionId)) throw new Error('Next battle already requested for this session');
++        replayed.add(result.sessionId);
++      }
+       const result = { state: 'submitted', commandId: p.commandId };
+       receipts.set(p.commandId, { fingerprint, result });
+       starting = true;
+@@ -68,7 +90,7 @@ export function createApplicationControl(deps: {
+       void Promise.resolve()
+         .then(() => {
+           if (disposed) return;
+-          return deps.quickStart(() => !disposed);
++          return deps.quickStart(() => !disposed, method === 'ui.nextBattle');
+         })
+         .catch((error: unknown) => {
+           if (!disposed) failure = error instanceof Error ? error.message : String(error);
+@@ -81,6 +103,7 @@ export function createApplicationControl(deps: {
+     dispose() {
+       disposed = true;
+       receipts.clear();
++      replayed.clear();
+     },
+   };
+ }
+diff --git a/src/games/gameSpeed.ts b/src/games/gameSpeed.ts
+index eea48a9..f9ca0b6 100644
+--- a/src/games/gameSpeed.ts
++++ b/src/games/gameSpeed.ts
+@@ -55,6 +55,7 @@ export function patchGameSpeedIni(bytes: Uint8Array, speed: number): Uint8Array
+ 
+ /** Shared by Workers/main thread before guest creation; like resolution/name overrides, affects only this startup and never modifies imported packages. */
+ export async function withGameSpeedDefault(source: GameSource): Promise<GameSource> {
++  if (source.preserveGameSettings) return source;
+   const speed = source.game.defaultGameSpeed;
+   if (speed === undefined) return source;
+   const path = gameResolutionIni(source.game.id);
+diff --git a/src/games/shared/nativeControl.ts b/src/games/shared/nativeControl.ts
+index 4b19fda..cfd703f 100644
+--- a/src/games/shared/nativeControl.ts
++++ b/src/games/shared/nativeControl.ts
+@@ -1,3 +1,4 @@
++import { scoutFrontiers, validateOilCapture } from './scoutFrontiers';
+ import type { GuestMemory } from '../../vm86/win32';
+ import type { BattleEntity, BattleObservation } from '@ra2vm/control/contracts';
+ import type { GameControl } from '../control';
+@@ -19,6 +20,7 @@ export interface NativeControlProfile {
+   frame: number;
+   localHouse: number;
+   houseIndex: number;
++  diplomacy?: { houseType: number; passive: number; allies: number; evidence: { address: number; bytes: readonly number[] } };
+   cash: number;
+   battleResult?: NativeBattleResultProfile;
+   foundation?: {
+@@ -103,6 +105,7 @@ export function createNativeControl(
+     profile.viewport.position,
+     profile.viewport.floor,
+     ...(profile.battleResult ? [profile.battleResult.terminal, ...profile.battleResult.evidence] : []),
++    ...(profile.diplomacy ? [profile.diplomacy.evidence] : []),
+     ...(profile.foundation ? [profile.foundation.widthEvidence, profile.foundation.heightEvidence] : []),
+     ...(profile.supportPowers
+       ? [
+@@ -239,6 +242,7 @@ export function createNativeControl(
+     poll();
+     const view = nativeViewport(memory, profile.viewport);
+     const entities: BattleEntity[] = [];
++    const owned: NonNullable<BattleObservation["owned"]> = [];
+     for (const array of profile.arrays) {
+       const vector = u32(array.address + 4),
+         count = u32(array.address + 16);
+@@ -258,15 +262,38 @@ export function createNativeControl(
+           y = u32(object + profile.location + 4) | 0,
+           z = u32(object + profile.location + 8) | 0;
+         const screen = view.visible(object, { x, y, z }, owner === house, u32(house + profile.houseIndex));
+-        if (!screen) continue;
++        // Only owned positions may be tracked outside the viewport. No hidden enemy data is published.
++        if (!screen && owner !== house) continue;
+         const type = pointer(u32(object + array.typeOffset));
+         const name = memory.read_memory(type + 0x24, 24);
+         const end = name.indexOf(0);
++        if (owner === house) owned.push({
++          id: String(u32(object + profile.uniqueId)), kind: array.kind,
++          owner: u32(house + profile.houseIndex), relation: 'self', health,
++          mission: u32(object + profile.mission) | 0,
++          cell: { x: Math.floor(x / 256), y: Math.floor(y / 256) },
++          type: new TextDecoder().decode(name.subarray(0, end < 0 ? name.length : end)),
++        });
++        if (!screen) continue;
+         visiblePointers.set(String(u32(object + profile.uniqueId)), object);
+         entities.push({
+           id: String(u32(object + profile.uniqueId)),
+           kind: array.kind,
+           owner: u32(owner + profile.houseIndex),
++          relation: (() => {
++            if (owner === house) return 'self' as const;
++            const d = profile.diplomacy;
++            if (!d) return 'unknown' as const;
++            const index = u32(owner + profile.houseIndex);
++            if (index > 31) return 'unknown' as const;
++            const country = u32(owner + d.houseType);
++            if (!country) return 'unknown' as const;
++            pointer(country);
++            const passive = u8(country + d.passive);
++            if (passive > 1) return 'unknown' as const;
++            if (passive) return 'neutral' as const;
++            return (u32(house + d.allies) & (1 << index)) !== 0 ? 'ally' as const : 'enemy' as const;
++          })(),
+           ...(owner === house ? { health, mission: u32(object + profile.mission) | 0 } : {}),
+           position: { x, y, z },
+           screen,
+@@ -303,6 +330,8 @@ export function createNativeControl(
+       viewport: view.viewport,
+       production,
+       entities,
++      owned,
++      exploration: scoutFrontiers(owned.filter(e => e.kind !== 'building').map(e => e.cell), view.shroudState),
+       sidebarTab: u32(profile.sidebar.instance + profile.sidebar.activeTab),
+       ...(profile.supportPowers
+         ? (() => {
+@@ -377,6 +406,7 @@ export function createNativeControl(
+     'camera',
+     'move',
+     'attack',
++    'capture',
+     'attack-move',
+     'stop',
+     'guard',
+@@ -575,13 +605,14 @@ export function createNativeControl(
+           }
+         }
+         target(4, entity);
+-        view.setUint32(0, playerActions[action as keyof typeof playerActions], true);
++        view.setUint32(0, playerActions[(action === 'capture' ? 'attack' : action) as keyof typeof playerActions], true);
+         destination(entity.cell, entity.position.z);
+         if ((action === 'repair' || action === 'sell') && entity.kind !== 'building')
+           throw new Error('This action requires an owned building');
+-        if (action === 'attack') {
++        if (action === 'attack' || action === 'capture') {
+           const enemy = state.entities.find((e) => e.id === params.target);
+           if (!enemy) throw new Error('Target is not visible in the current viewport');
++          if (action === 'capture') validateOilCapture(entity, enemy);
+           target(12, enemy);
+           destination(enemy.cell, enemy.position.z);
+         }
+@@ -591,7 +622,7 @@ export function createNativeControl(
+             throw new Error('Destination is outside the map');
+           destination(cell);
+         }
+-        if (action === 'move' || action === 'attack-move' || action === 'attack') {
++        if (action === 'move' || action === 'attack-move' || action === 'attack' || action === 'capture') {
+           const nativeCell = nativeViewport(memory, profile.viewport).cellAt(
+             view.getInt16(20, true),
+             view.getInt16(22, true),
+diff --git a/src/games/shared/nativeViewport.ts b/src/games/shared/nativeViewport.ts
+index 1c5addc..563740a 100644
+--- a/src/games/shared/nativeViewport.ts
++++ b/src/games/shared/nativeViewport.ts
+@@ -45,6 +45,12 @@ export function nativeViewport(memory: GuestMemory, profile: NativeViewportProfi
+   return {
+     viewport,
+     cellAt,
++    shroudState(location: { x: number; y: number }): 'invalid' | 'revealed' | 'shrouded' {
++      const cell = cellAt(location.x, location.y);
++      if (!cell) return 'invalid';
++      return !!(u32(cell + 0x12c) & 8) && byte(cell + 0x120) === 255 && byte(cell + 0x121) === 255
++        ? 'revealed' : 'shrouded';
++    },
+     visible(object: number, location: { x: number; y: number; z: number }, owned: boolean, player: number) {
+       const x = Math.trunc((30 * location.x - 30 * location.y) / 256) - viewport.x;
+       const y =
+diff --git a/src/games/source.ts b/src/games/source.ts
+index 026c1f1..bcd943d 100644
+--- a/src/games/source.ts
++++ b/src/games/source.ts
+@@ -12,4 +12,6 @@ export interface GameSource {
+   additionalFiles?: ReadonlyMap<string, Uint8Array>;
+   /** Game-generated launch configuration, separate from validated user map add-ons. */
+   sessionFiles?: ReadonlyMap<string, Uint8Array>;
++  /** Replaying native saved settings must not reapply first-launch speed defaults. */
++  preserveGameSettings?: boolean;
+ }
+diff --git a/src/games/yr/control.ts b/src/games/yr/control.ts
+index 01133af..bfc9122 100644
+--- a/src/games/yr/control.ts
++++ b/src/games/yr/control.ts
+@@ -7,6 +7,11 @@ export const YR_CONTROL_PROFILE: NativeControlProfile = {
+   frame: 0xa8ed84,
+   localHouse: 0xa83d4c,
+   houseIndex: 0x30,
++  // YRpp House.Type / HouseType.MultiplayPassive; native IsAlliedWith reads +0x5788.
++  diplomacy: {
++    houseType: 0x34, passive: 0x1a6, allies: 0x5788,
++    evidence: { address: 0x4f9a10, bytes: [0x8b,0xc1,0x8b,0x4c,0x24,0x04,0x3b,0x48,0x30,0x75,0x05,0xb0,0x01,0xc2,0x04,0x00,0x83,0xf9,0xff,0x74,0x18,0x8b,0x80,0x88,0x57,0x00,0x00] },
++  },
+   // Native logic-loop completion: local win/loss globals, captured before House teardown.
+   battleResult: {
+     win: 0xa83d49,
+diff --git a/src/ui/pages/game/page.ts b/src/ui/pages/game/page.ts
+index a54d0f9..8a148d2 100644
+--- a/src/ui/pages/game/page.ts
++++ b/src/ui/pages/game/page.ts
+@@ -5,6 +5,7 @@ import { controlSession } from './controlSession';
+ import { createApplicationControl } from '../../../app/session/applicationControl';
+ import { PresentedFrameCapture } from '../../../graphics/presentedFrameCapture';
+ import { encodeFrameImage } from '../../../platform/browser/frameImage';
++import { startCanvasBroadcast } from '../../../platform/browser/canvasBroadcast';
+ import {
+   bootState,
+   controlReady,
+@@ -98,11 +99,21 @@ export async function startVmPage(canvas: HTMLCanvasElement): Promise<void> {
+       if (!capturePresentation) throw new Error('No active presentation');
+       return capturePresentation();
+     },
+-    quickStart: async (isCurrent) => {
++    quickStart: async (isCurrent, replay = false) => {
+       const source = controlSource;
+       if (!source) throw new Error('Game resources unavailable');
++      let nextSource = source;
++      if (replay) {
++        if (!activeVm) throw new Error('Replay runtime unavailable');
++        const saved = (await activeVm.gameControl('ui.replaySettings')) as { path: string; bytes: number[] };
++        nextSource = {
++          ...source,
++          preserveGameSettings: true,
++          sessionFiles: new Map([...(source.sessionFiles ?? []), [saved.path, Uint8Array.from(saved.bytes)]]),
++        };
++      }
+       await releaseControlRuntime?.();
+-      if (isCurrent()) await startVmRuntime(canvas, source, 'battle');
++      if (isCurrent()) await startVmRuntime(canvas, nextSource, 'battle');
+     },
+   });
+   controlSession.attach((method, params) => applicationControl!.request(method, params));
+@@ -231,6 +242,19 @@ async function startVmRuntime(canvas: HTMLCanvasElement, source?: GameSource, st
+     presenter.invalidate();
+     return encodeFrameImage(await pending);
+   };
++  const stopBroadcast = import.meta.env.DEV
++    ? startCanvasBroadcast(
++        canvas,
++        () => {
++          presenter.invalidate();
++          presenter.render();
++          return presenter.frameVersion;
++        },
++        'http://127.0.0.1:3098/api/game/video',
++        () => vm?.notifyFramePresented?.(),
++        () => vm?.getAudioStream?.() ?? null,
++      )
++    : () => {};
+   const effects: FrameEffectController<LiveModelId> = new FrameEffectController<LiveModelId>({
+     create: import.meta.env.DEV
+       ? async (changed) => {
+@@ -398,6 +422,7 @@ async function startVmRuntime(canvas: HTMLCanvasElement, source?: GameSource, st
+   };
+ 
+   activeRendererCleanup = () => {
++    stopBroadcast();
+     effects.stop();
+     presenter.destroy();
+   };
+diff --git a/tests/basic/applicationControl.test.ts b/tests/basic/applicationControl.test.ts
+index 9d9e7c2..1b525cb 100644
+--- a/tests/basic/applicationControl.test.ts
++++ b/tests/basic/applicationControl.test.ts
+@@ -17,6 +17,34 @@ function fixture() {
+ }
+ const command = { commandId: 'start-1', expectedPageId: '1', replaceSession: true };
+ 
++it('replays only a confirmed native result and claims each finished session once', async () => {
++  const state = { pageId: '1', phase: 'running', hasResources: true, hasRuntime: true };
++  let result: unknown = { battlefield: { ready: true } };
++  const quickStart = vi.fn(async (_isCurrent: () => boolean, _replay?: boolean) => {});
++  const control = createApplicationControl({ state: () => state, runtime: async () => result, quickStart });
++  const next = { ...command, expectedSessionId: 'ended' };
++  await expect(control.request('ui.nextBattle', next)).rejects.toThrow('native victory or defeat');
++  result = {
++    battlefield: { ready: false },
++    battleResult: { sessionId: 'ended', outcome: 'unknown', source: 'native-game-loop' },
++  };
++  await expect(control.request('ui.nextBattle', next)).rejects.toThrow('native victory or defeat');
++  result = {
++    battlefield: { ready: false },
++    battleResult: { sessionId: 'ended', outcome: 'defeat', source: 'native-game-loop' },
++  };
++  await expect(control.request('ui.nextBattle', { ...next, expectedSessionId: 'other' })).rejects.toThrow(
++    'native victory or defeat',
++  );
++  await expect(control.request('ui.nextBattle', { ...next, replaceSession: false })).rejects.toThrow('replaceSession');
++  await control.request('ui.nextBattle', next);
++  await vi.waitFor(async () => expect(await control.request('ui.status')).toMatchObject({ starting: false }));
++  await control.request('ui.nextBattle', next);
++  expect(quickStart).toHaveBeenCalledOnce();
++  expect(quickStart.mock.calls[0]?.[1]).toBe(true);
++  await expect(control.request('ui.nextBattle', { ...next, commandId: 'other' })).rejects.toThrow('already requested');
++});
++
+ it('captures only the current page and rejects results completed after replacement or disposal', async () => {
+   const state = { pageId: '1', phase: 'running', hasResources: true, hasRuntime: true };
+   let finish!: (value: unknown) => void;
+diff --git a/tests/basic/gameSpeed.test.ts b/tests/basic/gameSpeed.test.ts
+index a9687cb..ee8392b 100644
+--- a/tests/basic/gameSpeed.test.ts
++++ b/tests/basic/gameSpeed.test.ts
+@@ -10,6 +10,17 @@ const encode = (s: string) => Uint8Array.from(s, (c) => c.charCodeAt(0));
+ const decode = (b: Uint8Array) => String.fromCharCode(...b);
+ 
+ describe('原版启动速度', () => {
++  it('does not overwrite native settings explicitly retained for the next round', async () => {
++    const bytes = encode('[Options]\nGameSpeed=2\n[Skirmish]\nGameSpeed=2\nSlot01=6,8,1\n');
++    const source: GameSource = {
++      game: supportedGame('yr'),
++      files: new MemoryGameFileProvider(new Map([['RA2MD.INI', bytes]])),
++      executableBytes: new Uint8Array([1]),
++      preserveGameSettings: true,
++    };
++    const next = await withGameSpeedDefault(source);
++    expect(await next.files.read('RA2MD.INI')).toEqual(bytes);
++  });
+   it('只更新单机速度，保留联机设置、编码和 CRLF，清理重复键', () => {
+     const original =
+       '[Options]\r\nGameSpeed=2\r\ngamespeed=3\r\n;\xff\r\n[Skirmish]\r\nGameSpeed=1\r\n[LAN]\r\nGameSpeed=4\r\n';
+diff --git a/tests/basic/nativeControl.test.ts b/tests/basic/nativeControl.test.ts
+index 3328b08..5ca3ee7 100644
+--- a/tests/basic/nativeControl.test.ts
++++ b/tests/basic/nativeControl.test.ts
+@@ -10,6 +10,7 @@ describe.each([RA2_CONTROL_PROFILE, YR_CONTROL_PROFILE])('$game native control',
+     const memory = createGuestMemory();
+     for (const e of [
+       profile.hook,
++      ...(profile.diplomacy ? [profile.diplomacy.evidence] : []),
+       profile.sidebar.constructor,
+       profile.sidebar.action,
+       profile.sidebar.setTab,
+@@ -73,6 +74,71 @@ describe.each([RA2_CONTROL_PROFILE, YR_CONTROL_PROFILE])('$game native control',
+     return { memory, control, state, box: 0x80100, unit, house, tactical, cell };
+   }
+ 
++  it('routes engineer capture through native target-click and rejects non-engineers', () => {
++    if (!profile.diplomacy) return;
++    const { memory, control, unit, state, box } = fixture();
++    const infantry = profile.arrays.find(a => a.kind === 'infantry')!;
++    const buildings = profile.arrays.find(a => a.kind === 'building')!;
++    const target = 0x280000, oilType = 0x290000, neutral = 0x2a0000, country = 0x2b0000;
++    writeU32(memory, profile.arrays[0]!.address + 16, 0);
++    writeU32(memory, infantry.address + 4, 0x130000);
++    writeU32(memory, infantry.address + 16, 1);
++    writeU32(memory, unit + infantry.typeOffset, 0x120000);
++    writeAsciiZ(memory, 0x120000 + 0x24, 'ENGINEER');
++    memory.write_memory(new Uint8Array(memory.read_memory(unit, 0x800)), target);
++    writeU32(memory, buildings.address + 4, 0x270000);
++    writeU32(memory, buildings.address + 16, 1);
++    writeU32(memory, 0x270000, target);
++    writeU32(memory, target + profile.uniqueId, 88);
++    writeU32(memory, target + buildings.typeOffset, oilType);
++    writeAsciiZ(memory, oilType + 0x24, 'CAOILD');
++    writeU32(memory, target + profile.owner, neutral);
++    writeU32(memory, neutral + profile.houseIndex, 2);
++    writeU32(memory, neutral + profile.diplomacy.houseType, country);
++    memory.write_memory([1], country + profile.diplomacy.passive);
++    const params = { sessionId:state.sessionId, observedFrame:state.frame, commandId:'capture', action:'capture', unit:'77', target:'88' };
++    writeAsciiZ(memory, 0x120000 + 0x24, 'E1');
++    expect(() => control.request('command', params)).toThrow('engineer');
++    writeAsciiZ(memory, 0x120000 + 0x24, 'ENGINEER');
++    expect(control.request('command', { ...params, commandId:'capture-valid' })).toMatchObject({state:'pending'});
++    // The native decideAction/leftUp path determines capture, not a forced attack mission.
++    expect(new DataView(memory.read_memory(box + 16, 4).slice().buffer).getUint32(0,true)).toBe(2);
++  });
++
++  it('tracks only owned offscreen units without exposing hidden enemies', () => {
++    const { memory, control, unit } = fixture();
++    writeU32(memory, unit + profile.location, 256 * 300);
++    let observation = control.request('observe', undefined) as BattleObservation;
++    expect(observation.entities).toHaveLength(0);
++    expect(observation.owned?.[0]?.id).toBe('77');
++    const enemyHouse = 0x180000;
++    writeU32(memory, enemyHouse + profile.houseIndex, 1);
++    writeU32(memory, unit + profile.owner, enemyHouse);
++    observation = control.request('observe', undefined) as BattleObservation;
++    expect(observation.entities).toHaveLength(0);
++    expect(observation.owned).toHaveLength(0);
++  });
++
++  it('derives relationships from native diplomacy rather than house number', () => {
++    const { memory, control, unit, house } = fixture();
++    const other = 0x180000, country = 0x190000;
++    writeU32(memory, unit + profile.owner, other);
++    writeU32(memory, other + profile.houseIndex, 2);
++    const relation = () => (control.request('observe', undefined) as BattleObservation).entities[0]?.relation;
++    expect(relation()).toBe('unknown');
++    if (!profile.diplomacy) return;
++    const d = profile.diplomacy;
++    writeU32(memory, other + d.houseType, country);
++    memory.write_memory([1], country + d.passive);
++    expect(relation()).toBe('neutral');
++    memory.write_memory([0], country + d.passive);
++    expect(relation()).toBe('enemy');
++    writeU32(memory, house + d.allies, 1 << 2);
++    expect(relation()).toBe('ally');
++    memory.write_memory([2], country + d.passive);
++    expect(relation()).toBe('unknown');
++  });
++
+   it('publishes a bounded group table only after every member passes current-view validation', () => {
+     const { memory, control, state, unit, box } = fixture();
+     const request = { sessionId: state.sessionId, observedFrame: state.frame, commandId: 'group', action: 'guard' };
+@@ -145,6 +211,7 @@ describe.each([RA2_CONTROL_PROFILE, YR_CONTROL_PROFILE])('$game native control',
+     expect(memory.bytes.some(Boolean)).toBe(false);
+     const evidence = [
+       profile.hook,
++      ...(profile.diplomacy ? [profile.diplomacy.evidence] : []),
+       profile.sidebar.constructor,
+       profile.sidebar.action,
+       profile.sidebar.setTab,
+diff --git a/tests/basic/vmClient.test.ts b/tests/basic/vmClient.test.ts
+index 11dec54..36a2312 100644
+--- a/tests/basic/vmClient.test.ts
++++ b/tests/basic/vmClient.test.ts
+@@ -339,6 +339,25 @@ describe('WorkerVmClient RPC lifecycle', () => {
+     expect(worker.terminateCount).toBe(1);
+   });
+ 
++  it('releases a captured frame while background rAF is suspended, without duplicate ACKs', () => {
++    const raf = vi.fn();
++    vi.stubGlobal('requestAnimationFrame', raf.mockReturnValue(42));
++    vi.stubGlobal('cancelAnimationFrame', vi.fn());
++    const { worker, client } = setup({}, { onFrame: vi.fn() });
++    worker.emit({
++      type: 'frame',
++      frameId: 9,
++      frame: { width: 1, height: 1, pixels: new Uint8Array([1]), palette: new Uint8Array(1024) },
++    });
++    expect(worker.posts.filter((p) => (p as { type: string }).type === 'frame-ack')).toHaveLength(0);
++    client.notifyFramePresented();
++    client.notifyFramePresented();
++    raf.mock.calls[0]![0](0);
++    expect(worker.posts.filter((p) => (p as { type: string }).type === 'frame-ack')).toEqual([
++      { type: 'frame-ack', frameId: 9 },
++    ]);
++  });
++
+   it('sends frame ACK only at the rAF boundary and cancels a queued ACK on destroy', async () => {
+     let nextFrameCallback = 1;
+     const frameCallbacks = new Map<number, FrameRequestCallback>();
+diff --git a/docs/DAFEIYU_REPLAY.md b/docs/DAFEIYU_REPLAY.md
+new file mode 100644
+index 0000000..c35f8dc
+--- /dev/null
++++ b/docs/DAFEIYU_REPLAY.md
+@@ -0,0 +1,15 @@
++# Local replay pilot
++
++The pilot configuration `vite.dafeiyu.config.ts` binds only to loopback HTTP on port 15184. Start it with `pnpm exec vite --config vite.dafeiyu.config.ts` after preparing the normal dependencies. Original user-supplied game resources remain required.
++
++`ui.nextBattle` accepts `commandId`, `expectedPageId`, `expectedSessionId`, and `replaceSession: true`. It requires the specified session's native victory or defeat, refuses an active battlefield, and claims each ended session once. An unknown result, connection loss, or a menu alone is not permission to restart. Repeating the same accepted command ID returns its receipt; a different ID cannot restart the same ended session twice.
++
++The page exports only the supported game's saved settings INI from its current runtime before release. Settings are passed as a new session overlay, and the first-launch speed default is disabled for that replay. Both Worker and main-thread paths carry the preservation flag. Imported files are not modified. The native program still initializes the skirmish and loads its scenario.
++
++This interface is separate from `ui.quickStart`, whose original reset/default behavior remains unchanged. Confirm speed, opponent settings, and native startup in a real game before enabling unattended replay. Unit tests alone do not establish this compatibility.
++
++## Local audio/video output
++
++The development canvas broadcaster can include the session's game-audio mix through `VmShell.getAudioStream()`. The audio sink owns the original stream; the broadcaster clones tracks and stops only its clones on disconnection. Session destruction releases the original capture destination. Both Worker and main-thread runtimes expose the same contract. No microphone or desktop audio is captured.
++
++The receiver must offer both video and audio transceivers and allow audio playback. Source game volume affects the transmitted mix. Do not additionally capture the same game's system/application audio in the streaming application, as that duplicates the sound. Browser autoplay restrictions may require a user gesture. Changes require refreshing both source and receiver; transport tests do not prove that the live audience heard the audio.
+diff --git a/src/games/shared/scoutFrontiers.ts b/src/games/shared/scoutFrontiers.ts
+new file mode 100644
+index 0000000..69f1f19
+--- /dev/null
++++ b/src/games/shared/scoutFrontiers.ts
+@@ -0,0 +1,35 @@
++type Cell = { x: number; y: number };
++
++/** Bounded local samples of native shroud, never hidden object positions or path guarantees. */
++export function scoutFrontiers(anchors: Cell[], state: (cell: Cell) => 'invalid' | 'revealed' | 'shrouded') {
++  const cache = new Map<string, ReturnType<typeof state>>();
++  const read = (cell: Cell) => {
++    const key = `${cell.x},${cell.y}`;
++    if (!cache.has(key)) cache.set(key, state(cell));
++    return cache.get(key)!;
++  };
++  const result = new Map<string, Cell>();
++  const regions = new Set<string>();
++  for (const anchor of anchors) {
++    const region = `${Math.floor(anchor.x / 12)},${Math.floor(anchor.y / 12)}`;
++    if (regions.has(region)) continue;
++    if (regions.size >= 8) break;
++    regions.add(region);
++    for (let dx = -24; dx <= 24; dx += 4) for (let dy = -24; dy <= 24; dy += 4) {
++      const cell = { x: anchor.x + dx, y: anchor.y + dy };
++      if (read(cell) !== 'revealed') continue;
++      for (const [x, y] of [[4, 0], [-4, 0], [0, 4], [0, -4]]) {
++        const next = { x: cell.x + x!, y: cell.y + y! };
++        if (read(next) === 'shrouded') result.set(`${next.x},${next.y}`, next);
++      }
++    }
++  }
++  return { source: 'native-local-shroud' as const, frontiers: [...result.values()].slice(0, 64) };
++}
++
++export function validateOilCapture(unit: { type: string; kind: string }, target: { type: string; kind: string; relation?: string }) {
++  if (unit.kind !== 'infantry' || !['ENGINEER', 'SENGINEER', 'YENGINEER'].includes(unit.type))
++    throw new Error('Capture requires an owned engineer');
++  if (target.kind !== 'building' || target.type !== 'CAOILD' || target.relation !== 'neutral')
++    throw new Error('Capture requires a visible neutral oil derrick');
++}
+diff --git a/src/platform/browser/canvasBroadcast.ts b/src/platform/browser/canvasBroadcast.ts
+new file mode 100644
+index 0000000..adac4f1
+--- /dev/null
++++ b/src/platform/browser/canvasBroadcast.ts
+@@ -0,0 +1,183 @@
++/** Local canvas and session-audio broadcast. Never captures the desktop or microphone. */
++export function startCanvasBroadcast(
++  canvas: HTMLCanvasElement,
++  render: () => number | void,
++  endpoint: string,
++  presented: () => void = () => {},
++  audioSource: () => MediaStream | null = () => null,
++): () => void {
++  let dead = false;
++  let peer: RTCPeerConnection | null = null;
++  let stream: MediaStream | null = null;
++  let identity: string | null = null;
++  let audioIdentity: string | undefined;
++  let clock: Worker | null = null;
++  let meter: ReturnType<typeof setInterval> | null = null;
++  let timer: ReturnType<typeof setTimeout>;
++  const abort = new AbortController();
++  // Bound encoder work independently from the VM's display resolution.
++  const output = document.createElement('canvas');
++  const context = output.getContext('2d', { alpha: false });
++  if (!context) return () => {};
++  const reset = () => {
++    if (meter) clearInterval(meter);
++    meter = null;
++    clock?.terminate();
++    clock = null;
++    peer?.close();
++    peer = null;
++    stream?.getTracks().forEach((track) => track.stop());
++    stream = null;
++    identity = null;
++    audioIdentity = undefined;
++  };
++  async function poll() {
++    try {
++      const response = await fetch(endpoint, { signal: abort.signal });
++      if (!response.ok) throw new Error('Broadcast unavailable');
++      const { token, signal } = await response.json();
++      const sourceAudio = audioSource()?.getAudioTracks()[0];
++      if (peer && audioIdentity !== sourceAudio?.id) reset();
++      if (!signal) reset();
++      else if (signal.id !== identity) {
++        reset();
++        identity = signal.id;
++        const current = new RTCPeerConnection({ iceServers: [] });
++        peer = current;
++        await current.setRemoteDescription({ type: 'offer', sdp: signal.offer });
++        const scale = Math.min(1, 1280 / canvas.width, 960 / canvas.height);
++        output.width = Math.max(2, Math.floor((canvas.width * scale) / 2) * 2);
++        output.height = Math.max(2, Math.floor((canvas.height * scale) / 2) * 2);
++        stream = output.captureStream(0);
++        const track = stream.getVideoTracks()[0] as CanvasCaptureMediaStreamTrack;
++        track.contentHint = 'motion';
++        const sender = current.addTrack(track, stream);
++        if (sourceAudio) {
++          const audioTrack = sourceAudio.clone();
++          stream.addTrack(audioTrack);
++          current.addTrack(audioTrack, stream);
++          audioIdentity = sourceAudio.id;
++        }
++        await current.setLocalDescription(await current.createAnswer());
++        await new Promise<void>((resolve) => {
++          if (current.iceGatheringState === 'complete') return resolve();
++          const timeout = setTimeout(resolve, 2500);
++          current.addEventListener('icegatheringstatechange', () => {
++            if (current.iceGatheringState === 'complete') {
++              clearTimeout(timeout);
++              resolve();
++            }
++          });
++        });
++        if (dead || peer !== current) return;
++        const parameters = sender.getParameters();
++        if (parameters.encodings?.length) {
++          parameters.encodings[0]!.maxBitrate = 10_000_000;
++          parameters.encodings[0]!.maxFramerate = 60;
++          parameters.degradationPreference = 'maintain-framerate';
++          await sender.setParameters(parameters);
++        }
++        const result = await fetch(endpoint, {
++          method: 'POST',
++          signal: abort.signal,
++          headers: { 'Content-Type': 'application/json', 'X-Video-Token': token },
++          body: JSON.stringify({ kind: 'answer', id: identity, sdp: current.localDescription!.sdp }),
++        });
++        if (!result.ok) throw new Error('Broadcast answer rejected');
++        // A background tab's rAF is throttled. Render only the latest frame on the broadcast clock.
++        const url = URL.createObjectURL(
++          new Blob(
++            [
++              'let pending=false;onmessage=()=>pending=false;setInterval(()=>{if(!pending){pending=true;postMessage(0)}},1000/60)',
++            ],
++            { type: 'text/javascript' },
++          ),
++        );
++        clock = new Worker(url);
++        URL.revokeObjectURL(url);
++        let ticks = 0,
++          renderTime = 0,
++          previousFrames = 0,
++          previousEncode = 0,
++          previousTime = performance.now();
++        let measuring = false;
++        let uniqueFrames = 0,
++          lastVersion: number | void;
++        meter = setInterval(async () => {
++          if (measuring || dead || peer !== current) return;
++          measuring = true;
++          try {
++            const reports = await sender.getStats();
++            for (const report of reports.values()) {
++              if (report.type !== 'outbound-rtp' || report.kind !== 'video') continue;
++              const now = performance.now(),
++                frames = report.framesEncoded || 0,
++                encoded = report.totalEncodeTime || 0;
++              const values = {
++                fps: Math.max(0, ((frames - previousFrames) * 1000) / (now - previousTime)),
++                frames,
++                sourceFPS: (uniqueFrames * 1000) / (now - previousTime),
++                width: output.width,
++                height: output.height,
++                encodeMs: frames > previousFrames ? ((encoded - previousEncode) * 1000) / (frames - previousFrames) : 0,
++                renderMs: ticks ? renderTime / ticks : 0,
++                ticks,
++                timestamp: Date.now(),
++              };
++              uniqueFrames = 0;
++              previousFrames = frames;
++              previousEncode = encoded;
++              previousTime = now;
++              ticks = 0;
++              renderTime = 0;
++              await fetch(endpoint, {
++                method: 'POST',
++                signal: abort.signal,
++                headers: { 'Content-Type': 'application/json', 'X-Video-Token': token },
++                body: JSON.stringify({ kind: 'stats', id: identity, values }),
++              });
++            }
++          } catch {
++            /* Telemetry failure must not interrupt media. */
++          } finally {
++            measuring = false;
++          }
++        }, 3000);
++        clock.onmessage = () => {
++          const tickStarted = performance.now();
++          try {
++            if (current.connectionState === 'connected') {
++              // WebGL's default drawing buffer may be cleared after presentation.
++              // Redraw synchronously before copying, even when the game tab is visible.
++              const version = render();
++              if (typeof version === 'number' && version !== lastVersion) {
++                uniqueFrames++;
++                lastVersion = version;
++              }
++              context!.drawImage(canvas, 0, 0, output.width, output.height);
++              track.requestFrame();
++              presented();
++              ticks++;
++              renderTime += performance.now() - tickStarted;
++            }
++          } finally {
++            // One outstanding tick at most, even when encoding or the VM stalls.
++            clock?.postMessage(0);
++          }
++        };
++      }
++      if (peer && ['failed', 'closed'].includes(peer.connectionState)) reset();
++    } catch {
++      reset();
++    } finally {
++      if (!dead) timer = setTimeout(poll, 750);
++    }
++  }
++  void poll();
++  return () => {
++    dead = true;
++    clearTimeout(timer);
++    abort.abort();
++    reset();
++  };
++}
+diff --git a/tests/basic/audioCapture.test.ts b/tests/basic/audioCapture.test.ts
+new file mode 100644
+index 0000000..aa8fe56
+--- /dev/null
++++ b/tests/basic/audioCapture.test.ts
+@@ -0,0 +1,26 @@
++import { expect, it, vi } from 'vitest';
++import { WebAudioPcmSink } from '../../src/adapter/audio';
++
++it('shares the game mix without stopping local playback and releases capture on destroy', async () => {
++  const track = { stop: vi.fn() };
++  const stream = { getTracks: () => [track] };
++  const capture = { stream, disconnect: vi.fn() };
++  const gain = { gain: { value: 0 }, connect: vi.fn() };
++  const context = {
++    state: 'running',
++    destination: {},
++    close: vi.fn(async () => {}),
++    createGain: () => gain,
++    createMediaStreamDestination: vi.fn(() => capture),
++  };
++  const sink = new WebAudioPcmSink({ contextFactory: () => context as unknown as AudioContext });
++  expect(sink.getCaptureStream()).toBe(stream);
++  expect(sink.getCaptureStream()).toBe(stream);
++  expect(context.createMediaStreamDestination).toHaveBeenCalledTimes(1);
++  expect(gain.connect).toHaveBeenCalledWith(context.destination);
++  expect(gain.connect).toHaveBeenCalledWith(capture);
++  expect(track.stop).not.toHaveBeenCalled();
++  await sink.destroy();
++  expect(track.stop).toHaveBeenCalledTimes(1);
++  expect(sink.getCaptureStream()).toBeNull();
++});
+diff --git a/tests/basic/canvasBroadcast.test.ts b/tests/basic/canvasBroadcast.test.ts
+new file mode 100644
+index 0000000..9a16039
+--- /dev/null
++++ b/tests/basic/canvasBroadcast.test.ts
+@@ -0,0 +1,79 @@
++import { afterEach, expect, it, vi } from 'vitest';
++import { startCanvasBroadcast } from '../../src/platform/browser/canvasBroadcast';
++
++afterEach(() => {
++  vi.unstubAllGlobals();
++  vi.useRealTimers();
++});
++
++it('bounds encoder size, uses a single worker and releases capture resources', async () => {
++  vi.useFakeTimers();
++  const drawImage = vi.fn();
++  const track = { stop: vi.fn(), requestFrame: vi.fn(), contentHint: '' };
++  const audioClone = { stop: vi.fn() };
++  const sourceTrack = { id: 'game-audio', clone: vi.fn(() => audioClone), stop: vi.fn() };
++  const tracks = [track];
++  const output = {
++    width: 0,
++    height: 0,
++    getContext: () => ({ drawImage }),
++    captureStream: vi.fn(() => ({
++      getVideoTracks: () => [track],
++      getTracks: () => tracks,
++      addTrack: (value: typeof track) => tracks.push(value),
++    })),
++  };
++  const document = { hidden: true, createElement: () => output };
++  const parameters = { encodings: [{}], degradationPreference: '' };
++  const sender = { getParameters: () => parameters, setParameters: vi.fn(async () => {}) };
++  class Peer {
++    connectionState = 'connected';
++    iceGatheringState = 'complete';
++    localDescription = { sdp: 'v=0' };
++    setRemoteDescription = vi.fn(async () => {});
++    setLocalDescription = vi.fn(async () => {});
++    createAnswer = vi.fn(async () => ({ sdp: 'v=0' }));
++    addTrack = () => sender;
++    close = vi.fn();
++  }
++  const workers: Clock[] = [];
++  class Clock {
++    onmessage: (() => void) | null = null;
++    postMessage = vi.fn();
++    terminate = vi.fn();
++    constructor() {
++      workers.push(this);
++    }
++  }
++  vi.stubGlobal('document', document);
++  vi.stubGlobal('RTCPeerConnection', Peer);
++  vi.stubGlobal('Worker', Clock);
++  vi.stubGlobal(
++    'fetch',
++    vi.fn(async () => ({ ok: true, json: async () => ({ token: 'test', signal: { id: 'one', offer: 'v=0' } }) })),
++  );
++  const render = vi.fn();
++  const stop = startCanvasBroadcast(
++    { width: 2048, height: 1536 } as HTMLCanvasElement,
++    render,
++    'http://127.0.0.1/test',
++    () => {},
++    () => ({ getAudioTracks: () => [sourceTrack] }) as unknown as MediaStream,
++  );
++  await vi.advanceTimersByTimeAsync(1);
++  expect([output.width, output.height]).toEqual([1280, 960]);
++  expect(parameters.encodings[0]).toMatchObject({ maxFramerate: 60, maxBitrate: 10_000_000 });
++  expect(workers).toHaveLength(1);
++  workers[0]!.onmessage!();
++  expect(render).toHaveBeenCalledTimes(1);
++  expect(track.requestFrame).toHaveBeenCalledTimes(1);
++  document.hidden = false;
++  workers[0]!.onmessage!();
++  expect(render).toHaveBeenCalledTimes(2);
++  expect(drawImage).toHaveBeenCalledTimes(2);
++  stop();
++  expect(audioClone.stop).toHaveBeenCalledTimes(1);
++  expect(sourceTrack.stop).not.toHaveBeenCalled();
++  expect(track.stop).toHaveBeenCalledTimes(1);
++  expect(workers[0]!.terminate).toHaveBeenCalledTimes(1);
++});
+diff --git a/tests/basic/scoutFrontiers.test.ts b/tests/basic/scoutFrontiers.test.ts
+new file mode 100644
+index 0000000..da60d55
+--- /dev/null
++++ b/tests/basic/scoutFrontiers.test.ts
+@@ -0,0 +1,24 @@
++import { expect, it } from 'vitest';
++import { scoutFrontiers, validateOilCapture } from '../../src/games/shared/scoutFrontiers';
++
++it('returns only valid shrouded terrain next to revealed samples, with bounded reads', () => {
++  let reads = 0;
++  const result = scoutFrontiers([{ x: 12, y: 12 }], ({ x, y }) => {
++    reads++;
++    if (x < 0 || y < 0 || x > 32 || y > 32) return 'invalid';
++    return x <= 12 ? 'revealed' : 'shrouded';
++  });
++  expect(result.frontiers.length).toBeGreaterThan(0);
++  expect(result.frontiers.every(c => c.x === 16 && c.y >= 0 && c.y <= 32)).toBe(true);
++  expect(reads).toBeLessThan(250);
++  expect(scoutFrontiers([{ x: 12, y: 12 }], () => 'shrouded').frontiers).toEqual([]);
++});
++
++it('requires an engineer and a neutral oil derrick for capture', () => {
++  const unit = { type: 'ENGINEER', kind: 'infantry' };
++  const oil = { type: 'CAOILD', kind: 'building', relation: 'neutral' };
++  expect(() => validateOilCapture(unit, oil)).not.toThrow();
++  expect(() => validateOilCapture({ ...unit, type: 'MTNK' }, oil)).toThrow();
++  expect(() => validateOilCapture(unit, { ...oil, relation: 'enemy' })).toThrow();
++  expect(() => validateOilCapture(unit, { ...oil, type: 'GACNST' })).toThrow();
++});
+diff --git a/vite.dafeiyu.config.ts b/vite.dafeiyu.config.ts
+new file mode 100644
+index 0000000..08997b8
+--- /dev/null
++++ b/vite.dafeiyu.config.ts
+@@ -0,0 +1,9 @@
++import { defineConfig } from 'vite';
++import base from './vite.config';
++
++// Separate loopback-only pilot; never change the public site's TLS or serving policy.
++export default defineConfig({
++  ...base,
++  plugins: base.plugins?.filter((p) => (p as { name?: string })?.name !== 'vite:basic-ssl'),
++  server: { ...base.server, host: '127.0.0.1', port: 15184, https: undefined },
++});

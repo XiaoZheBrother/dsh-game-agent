@@ -1,0 +1,5 @@
+- insert:
+    - id: dsh-game-agent
+      name: dsh-game-agent
+      config:
+        enabled: false
