@@ -41,5 +41,13 @@
   "author": {
     "name": "XiaoZheBrother",
     "email": "958117002@qq.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/XiaoZheBrother/dsh-game-agent.git"
+  },
+  "homepage": "https://github.com/XiaoZheBrother/dsh-game-agent#readme",
+  "bugs": {
+    "url": "https://github.com/XiaoZheBrother/dsh-game-agent/issues"
   }
 }
