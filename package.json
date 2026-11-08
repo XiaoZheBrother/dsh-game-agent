@@ -1,6 +1,6 @@
 {
   "name": "dsh-game-agent",
-  "version": "0.1.0-alpha.1",
+  "version": "0.1.0-alpha.2",
   "description": "DSH 游戏 Agent：工具选择、观众指令、自主决策与可追溯经验",
   "type": "module",
   "main": "index.js",
@@ -28,7 +28,7 @@
   },
   "peerDependencies": {
     "@deepseek-ai/schemastery": "^3.18.4",
-    "dsh-live-studio": "^0.1.0-alpha.1"
+    "dsh-live-studio": "^0.1.0-alpha.1 || ^0.2.0-alpha.1"
   },
   "dsh": {
     "bundle": {

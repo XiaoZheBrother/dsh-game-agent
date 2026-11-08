@@ -4,3 +4,5 @@ __pycache__/
 .venv/
 *.tgz
 .state/
+
+pack-result.json
