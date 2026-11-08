@@ -2,7 +2,7 @@ import z from '@deepseek-ai/schemastery'
 import { fileURLToPath } from 'node:url'
 import { mountService } from 'dsh-live-studio/launcher.mjs'
 export const name='dsh-game-agent'
-export const inject=['connection']
+export const inject=['connection','webServer']
 export const Config=z.object({enabled:z.boolean().default(false),home:z.string().default(''),
   persona:z.string().default(''),python:z.string().default('python'),port:z.number().default(3098),
   jingyuUrl:z.string().default(''),model:z.string().default(''),cubismCore:z.string().default(''),pet:z.string().default(''),
