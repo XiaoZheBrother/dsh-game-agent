@@ -55,3 +55,7 @@ dsh plugin --profile web add '<生成的 tgz 绝对路径>'
 游戏插件需要先把同版本直播插件 tgz 安装到同一 profile。安装不会自动启用；填写插件配置后再打开 enabled。开发包不得覆盖正在运行的旧任务，请先停旧实例。开发版可从 [GitHub 源码](https://github.com/XiaoZheBrother/dsh-game-agent) 克隆后执行 `npm pack` 安装；目前不提供稳定版 Release。
 
 本次兼容更新允许与直播插件 0.2.0-alpha.1 组合安装；游戏战略、经验和自动续局行为不变，不新增任务。
+
+## 内置角色舞台
+
+配套 dsh-live-studio 0.2.0-alpha.2 可直接加载本地模型：配置 `model` 模型目录与 `cubismCore` SDK 文件路径，游戏画面即可嵌入内置舞台，无需另外启动鲸语。两项未填写时仍使用原有 `jingyuUrl` 配置。模型和 Core 不随包分发。本次只接通配置与共享渲染入口，未重启或验证真实游戏对局。
