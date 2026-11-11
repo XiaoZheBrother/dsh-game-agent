@@ -9,7 +9,13 @@
     "dsh-plugin",
     "dsh",
     "agent",
-    "game"
+    "game",
+    "deepseek-harness",
+    "ai-agent",
+    "bilibili",
+    "game-agent",
+    "red-alert-2",
+    "game-automation"
   ],
   "files": [
     "index.js",
@@ -21,7 +27,9 @@
     "README.md",
     "NOTICE.md",
     "LICENSE",
-    "adapters"
+    "adapters",
+    "docs/agent-guide.md",
+    "llms.txt"
   ],
   "engines": {
     "node": ">=22.19.0"

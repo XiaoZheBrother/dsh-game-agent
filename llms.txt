@@ -1,0 +1,13 @@
+# dsh-game-agent
+
+> A DeepSeek Harness (DSH) game-agent plugin for tool-based actions, viewer commands, autonomous play, and traceable game reflection. Currently targets a modified Red Alert 2 web client.
+
+DeepSeek Harness plugin documentation. Capabilities and installation limits are version-specific; consult the README and release notes.
+
+## Documentation
+
+- [README](https://raw.githubusercontent.com/XiaoZheBrother/dsh-game-agent/main/README.md): Chinese overview, capabilities, dependencies, screenshots, installation and limitations.
+- [Agent guide](https://raw.githubusercontent.com/XiaoZheBrother/dsh-game-agent/main/docs/agent-guide.md): Entry points, minimal configuration, tool parameters, results and completion checks.
+- [Package metadata](https://raw.githubusercontent.com/XiaoZheBrother/dsh-game-agent/main/package.json): Current source version and dependency declarations.
+- [Releases](https://github.com/XiaoZheBrother/dsh-game-agent/releases): Published packages; source and release capabilities may differ.
+- [Issues](https://github.com/XiaoZheBrother/dsh-game-agent/issues): Report reproducible problems.
